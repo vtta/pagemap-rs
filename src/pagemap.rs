@@ -1,6 +1,11 @@
-use std::fmt;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use async_std::{
+    fs::File,
+    io::{prelude::*, BufReader, SeekFrom},
+    stream::StreamExt,
+};
+use futures::future::try_join_all;
+use std::iter::Iterator;
+use std::{fmt, iter};
 
 use crate::{
     error::{PageMapError, Result},
@@ -264,15 +269,17 @@ impl PageMap {
     const KPAGEFLAGS: &'static str = "/proc/kpageflags";
 
     /// Construct a new `PageMap` for the process with the given `PID`.
-    pub fn new(pid: u64) -> Result<Self> {
+    pub async fn new(pid: u64) -> Result<Self> {
         let (kcf, kff) = (
             File::open(Self::KPAGECOUNT)
+                .await
                 .map_err(|e| PageMapError::Open {
                     path: Self::KPAGECOUNT.into(),
                     source: e,
                 })
                 .ok(),
             File::open(Self::KPAGEFLAGS)
+                .await
                 .map_err(|e| PageMapError::Open {
                     path: Self::KPAGEFLAGS.into(),
                     source: e,
@@ -287,15 +294,19 @@ impl PageMap {
             pid,
             mf: BufReader::with_capacity(
                 1 << 14,
-                File::open(&maps_path).map_err(|e| PageMapError::Open {
-                    path: maps_path,
+                File::open(&maps_path)
+                    .await
+                    .map_err(|e| PageMapError::Open {
+                        path: maps_path,
+                        source: e,
+                    })?,
+            ),
+            pmf: File::open(&pagemap_path)
+                .await
+                .map_err(|e| PageMapError::Open {
+                    path: pagemap_path,
                     source: e,
                 })?,
-            ),
-            pmf: File::open(&pagemap_path).map_err(|e| PageMapError::Open {
-                path: pagemap_path,
-                source: e,
-            })?,
             kcf,
             kff,
             page_size: page_size()?,
@@ -309,7 +320,7 @@ impl PageMap {
 
     /// Returns all virtual memory mappings for the process at hand, as parsed from
     /// `/proc/<PID>/maps`.
-    pub fn maps(&mut self) -> Result<Vec<MapsEntry>> {
+    pub async fn maps(&mut self) -> Result<Vec<MapsEntry>> {
         let pid = self.pid;
         self.mf
             .by_ref()
@@ -322,31 +333,45 @@ impl PageMap {
                 .parse()
             })
             .collect()
+            .await
     }
 
     /// Returns the entries parsed from reading `/proc/<PID>/pagemap` for all pages in the
     /// specified [`VirtualMemoryArea`] of the process at hand.
-    pub fn pagemap_vma(&mut self, vma: &VirtualMemoryArea) -> Result<Vec<PageMapEntry>> {
+
+    async fn pagemap_vma_of(
+        pid: u64,
+        page_size: u64,
+        pmf: File,
+        vma: &VirtualMemoryArea,
+    ) -> Result<Vec<PageMapEntry>> {
         let mut buf = [0; 8];
-        (vma.start..vma.end)
-            .step_by(self.page_size as usize)
-            .map(|addr: u64| -> Result<_> {
-                let vpn = addr / self.page_size;
-                self.pmf
-                    .seek(SeekFrom::Start(vpn * 8))
-                    .map_err(|e| PageMapError::Seek {
-                        path: format!("/proc/{}/pagemap", self.pid),
-                        source: e,
-                    })?;
-                self.pmf
-                    .read_exact(&mut buf)
-                    .map_err(|e| PageMapError::Read {
-                        path: format!("/proc/{}/pagemap", self.pid),
-                        source: e,
-                    })?;
-                Ok(u64::from_ne_bytes(buf).into())
-            })
-            .collect::<Result<_>>()
+        try_join_all(
+            (vma.start..vma.end)
+                .step_by(page_size as _)
+                .zip(iter::repeat(pmf.clone()))
+                .map(async move |(addr, mut pmf)| {
+                    let vpn = addr / page_size;
+                    pmf.seek(SeekFrom::Start(vpn * 8))
+                        .await
+                        .map_err(|e| PageMapError::Seek {
+                            path: format!("/proc/{}/pagemap", pid),
+                            source: e,
+                        })?;
+                    pmf.read_exact(&mut buf)
+                        .await
+                        .map_err(|e| PageMapError::Read {
+                            path: format!("/proc/{}/pagemap", pid),
+                            source: e,
+                        })?;
+                    Ok(u64::from_ne_bytes(buf).into())
+                }),
+        )
+        .await
+    }
+
+    pub async fn pagemap_vma(&mut self, vma: &VirtualMemoryArea) -> Result<Vec<PageMapEntry>> {
+        Self::pagemap_vma_of(self.pid, self.page_size, self.pmf.clone(), vma).await
     }
 
     /// Returns the information about memory mappings, as parsed from reading `/proc/<PID>/maps`,
@@ -355,22 +380,51 @@ impl PageMap {
     ///
     /// If permitted, every [`PageMapEntry`] is also populated with information read from
     /// `/proc/kpagecount` and `/proc/kpageflags`.
-    pub fn pagemap(&mut self) -> Result<Vec<(MapsEntry, Vec<PageMapEntry>)>> {
-        self.maps()?
-            .into_iter()
-            .map(|map_entry| {
-                let mut pmes = self.pagemap_vma(&map_entry.vma)?;
-                if self.kcf.is_some() && self.kff.is_some() {
+    pub async fn pagemap(&mut self) -> Result<Vec<(MapsEntry, Vec<PageMapEntry>)>> {
+        let (pid, page_size, pmf) = (self.pid, self.page_size, self.pmf.clone());
+        let kcf = self
+            .kcf
+            .clone()
+            .ok_or_else(|| PageMapError::Access(Self::KPAGECOUNT.into()))?;
+        let kff = self
+            .kff
+            .clone()
+            .ok_or_else(|| PageMapError::Access(Self::KPAGEFLAGS.into()))?;
+        try_join_all(
+            self.maps()
+                .await?
+                .into_iter()
+                .zip(iter::repeat((pmf, kcf, kff)))
+                .map(async move |(map_entry, (pmf, kcf, kff))| {
+                    let mut pmes =
+                        Self::pagemap_vma_of(pid, page_size, pmf, &map_entry.vma()).await?;
                     for pme in &mut pmes {
                         if let Ok(pfn) = pme.pfn() {
-                            pme.kpgcn = Some(self.kpagecount(pfn)?);
-                            pme.kpgfl = Some(self.kpageflags(pfn)?);
+                            pme.kpgcn = Some(Self::kpagecount_of(kcf.clone(), pfn).await?);
+                            pme.kpgfl = Some(Self::kpageflags_of(kff.clone(), pfn).await?);
                         }
                     }
-                }
-                Ok((map_entry, pmes))
-            })
-            .collect()
+                    Ok((map_entry, pmes))
+                }),
+        )
+        .await
+    }
+
+    async fn kpagecount_of(mut kcf: File, pfn: u64) -> Result<u64> {
+        let mut buf = [0; 8];
+        kcf.seek(SeekFrom::Start(pfn * 8))
+            .await
+            .map_err(|e| PageMapError::Seek {
+                path: Self::KPAGECOUNT.into(),
+                source: e,
+            })?;
+        kcf.read_exact(&mut buf)
+            .await
+            .map_err(|e| PageMapError::Read {
+                path: Self::KPAGECOUNT.into(),
+                source: e,
+            })?;
+        Ok(u64::from_ne_bytes(buf))
     }
 
     /// Attempt to read the number of times that the page with the given `PFN` is referenced, from
@@ -383,22 +437,29 @@ impl PageMap {
     ///
     /// Most importantly, the method may return [`PageMapError::Access`] if opening
     /// `/proc/kpagecount` was not permitted at the time that the `PageMapEntry` was instantiated.
-    pub fn kpagecount(&self, pfn: u64) -> Result<u64> {
-        let mut buf = [0; 8];
-        let mut kcf = self
+    pub async fn kpagecount(&self, pfn: u64) -> Result<u64> {
+        let kcf = self
             .kcf
-            .as_ref()
+            .clone()
             .ok_or_else(|| PageMapError::Access(Self::KPAGECOUNT.into()))?;
-        kcf.seek(SeekFrom::Start(pfn * 8))
+        Self::kpagecount_of(kcf, pfn).await
+    }
+
+    async fn kpageflags_of(mut kff: File, pfn: u64) -> Result<KPageFlags> {
+        let mut buf = [0; 8];
+        kff.seek(SeekFrom::Start(pfn * 8))
+            .await
             .map_err(|e| PageMapError::Seek {
-                path: Self::KPAGECOUNT.into(),
+                path: Self::KPAGEFLAGS.into(),
                 source: e,
             })?;
-        kcf.read_exact(&mut buf).map_err(|e| PageMapError::Read {
-            path: Self::KPAGECOUNT.into(),
-            source: e,
-        })?;
-        Ok(u64::from_ne_bytes(buf))
+        kff.read_exact(&mut buf)
+            .await
+            .map_err(|e| PageMapError::Read {
+                path: Self::KPAGEFLAGS.into(),
+                source: e,
+            })?;
+        Ok(KPageFlags::from_bits_truncate(u64::from_ne_bytes(buf)))
     }
 
     /// Attempt to read the flags for the page with the given `PFN` from `/proc/kpageflags`.
@@ -410,21 +471,11 @@ impl PageMap {
     ///
     /// Most importantly, the method may return [`PageMapError::Access`] if opening
     /// `/proc/kpageflags` was not permitted at the time that the `PageMapEntry` was instantiated.
-    pub fn kpageflags(&self, pfn: u64) -> Result<KPageFlags> {
-        let mut buf = [0; 8];
-        let mut kff = self
+    pub async fn kpageflags(&self, pfn: u64) -> Result<KPageFlags> {
+        let kff = self
             .kff
-            .as_ref()
+            .clone()
             .ok_or_else(|| PageMapError::Access(Self::KPAGEFLAGS.into()))?;
-        kff.seek(SeekFrom::Start(pfn * 8))
-            .map_err(|e| PageMapError::Seek {
-                path: Self::KPAGEFLAGS.into(),
-                source: e,
-            })?;
-        kff.read_exact(&mut buf).map_err(|e| PageMapError::Read {
-            path: Self::KPAGEFLAGS.into(),
-            source: e,
-        })?;
-        Ok(KPageFlags::from_bits_truncate(u64::from_ne_bytes(buf)))
+        Self::kpageflags_of(kff, pfn).await
     }
 }

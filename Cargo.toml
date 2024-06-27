@@ -14,3 +14,5 @@ categories = ["os", "os::linux-apis", "memory-management"]
 bitflags = "1.2"
 libc = "0.2"
 thiserror = "1.0"
+futures = "0.3.0"
+async-std = {version = "1", features = ["unstable"]}

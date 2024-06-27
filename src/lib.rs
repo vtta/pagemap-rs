@@ -1,6 +1,7 @@
 //! A crate to provide a simple API to Linux kernel's
 //! [pagemap API](https://www.kernel.org/doc/Documentation/vm/pagemap.txt).
 
+#![feature(async_closure)]
 #![doc(html_root_url = "https://docs.rs/pagemap/0.1.0")]
 #![warn(rust_2018_idioms)]
 #![deny(
@@ -33,23 +34,25 @@ pub fn page_size() -> Result<u64> {
 /// Convenience function for [`PageMap::maps`], to parse all entries of `/proc/PID/maps` for the
 /// process with the given `PID`.
 #[inline]
-pub fn maps(pid: u64) -> Result<Vec<MapsEntry>> {
-    PageMap::new(pid)?.maps()
+pub async fn maps(pid: u64) -> Result<Vec<MapsEntry>> {
+    PageMap::new(pid).await?.maps().await
 }
 
 /// Convenience wrapper for [`PageMap::pagemap`], to retrieve the entries of `/proc/PID/maps` for
 /// the process with the given `PID`, combined with those in `/proc/PID/pagemap` (and also
 /// `/proc/kpagecount` and `/proc/kpageflags`, if permitted).
 #[inline]
-pub fn pagemap(pid: u64) -> Result<Vec<(MapsEntry, Vec<PageMapEntry>)>> {
-    PageMap::new(pid)?.pagemap()
+pub async fn pagemap(pid: u64) -> Result<Vec<(MapsEntry, Vec<PageMapEntry>)>> {
+    PageMap::new(pid).await?.pagemap().await
 }
 
 /// Calculate the "unique set size" (USS) (i.e., the amount of memory that a process is using
 /// which is not shared with any other process) in bytes.
-pub fn uss(pid: u64) -> Result<u64> {
-    Ok(PageMap::new(pid)?
-        .pagemap()?
+pub async fn uss(pid: u64) -> Result<u64> {
+    Ok(PageMap::new(pid)
+        .await?
+        .pagemap()
+        .await?
         .iter()
         .map(|(_, pmes)| {
             pmes.iter()
