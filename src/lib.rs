@@ -1,7 +1,6 @@
 //! A crate to provide a simple API to Linux kernel's
 //! [pagemap API](https://www.kernel.org/doc/Documentation/vm/pagemap.txt).
 
-#![feature(async_closure)]
 #![doc(html_root_url = "https://docs.rs/pagemap/0.1.0")]
 #![warn(rust_2018_idioms)]
 #![deny(

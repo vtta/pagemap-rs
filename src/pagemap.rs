@@ -1,9 +1,9 @@
 use async_std::{
     fs::File,
     io::{prelude::*, BufReader, SeekFrom},
-    stream::StreamExt,
+    stream,
 };
-use futures::future::try_join_all;
+use futures::stream::{StreamExt, TryStreamExt};
 use std::iter::Iterator;
 use std::{fmt, iter};
 
@@ -25,7 +25,7 @@ use crate::{
 ///
 /// Documentation and details about the various bits of the API can be found in Linux, at
 /// [`doc/Documentation/vm/pagemap.txt`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PageMapEntry {
     pgmap: u64,
     kpgcn: Option<u64>,
@@ -332,7 +332,7 @@ impl PageMap {
                 })?
                 .parse()
             })
-            .collect()
+            .try_collect()
             .await
     }
 
@@ -346,28 +346,28 @@ impl PageMap {
         vma: &VirtualMemoryArea,
     ) -> Result<Vec<PageMapEntry>> {
         let mut buf = [0; 8];
-        try_join_all(
+        let s = stream::from_iter(
             (vma.start..vma.end)
                 .step_by(page_size as _)
-                .zip(iter::repeat(pmf.clone()))
-                .map(async move |(addr, mut pmf)| {
-                    let vpn = addr / page_size;
-                    pmf.seek(SeekFrom::Start(vpn * 8))
-                        .await
-                        .map_err(|e| PageMapError::Seek {
-                            path: format!("/proc/{}/pagemap", pid),
-                            source: e,
-                        })?;
-                    pmf.read_exact(&mut buf)
-                        .await
-                        .map_err(|e| PageMapError::Read {
-                            path: format!("/proc/{}/pagemap", pid),
-                            source: e,
-                        })?;
-                    Ok(u64::from_ne_bytes(buf).into())
-                }),
+                .zip(iter::repeat(pmf.clone())),
         )
-        .await
+        .then(|(addr, mut pmf)| async move {
+            let vpn = addr / page_size;
+            pmf.seek(SeekFrom::Start(vpn * 8))
+                .await
+                .map_err(|e| PageMapError::Seek {
+                    path: format!("/proc/{}/pagemap", pid),
+                    source: e,
+                })?;
+            pmf.read_exact(&mut buf)
+                .await
+                .map_err(|e| PageMapError::Read {
+                    path: format!("/proc/{}/pagemap", pid),
+                    source: e,
+                })?;
+            Ok(PageMapEntry::from(u64::from_ne_bytes(buf)))
+        });
+        s.try_collect().await
     }
 
     pub async fn pagemap_vma(&mut self, vma: &VirtualMemoryArea) -> Result<Vec<PageMapEntry>> {
@@ -390,23 +390,23 @@ impl PageMap {
             .kff
             .clone()
             .ok_or_else(|| PageMapError::Access(Self::KPAGEFLAGS.into()))?;
-        try_join_all(
+        stream::from_iter(
             self.maps()
                 .await?
                 .into_iter()
-                .zip(iter::repeat((pmf, kcf, kff)))
-                .map(async move |(map_entry, (pmf, kcf, kff))| {
-                    let mut pmes =
-                        Self::pagemap_vma_of(pid, page_size, pmf, &map_entry.vma()).await?;
-                    for pme in &mut pmes {
-                        if let Ok(pfn) = pme.pfn() {
-                            pme.kpgcn = Some(Self::kpagecount_of(kcf.clone(), pfn).await?);
-                            pme.kpgfl = Some(Self::kpageflags_of(kff.clone(), pfn).await?);
-                        }
-                    }
-                    Ok((map_entry, pmes))
-                }),
+                .zip(iter::repeat((pmf, kcf, kff))),
         )
+        .then(|(map_entry, (pmf, kcf, kff))| async move {
+            let mut pmes = Self::pagemap_vma_of(pid, page_size, pmf, &map_entry.vma()).await?;
+            for pme in &mut pmes {
+                if let Ok(pfn) = pme.pfn() {
+                    pme.kpgcn = Some(Self::kpagecount_of(kcf.clone(), pfn).await?);
+                    pme.kpgfl = Some(Self::kpageflags_of(kff.clone(), pfn).await?);
+                }
+            }
+            Ok((map_entry, pmes))
+        })
+        .try_collect()
         .await
     }
 
